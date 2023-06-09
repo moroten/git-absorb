@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""\
+Runs 'git commit --fixup' on unstaged changes by analysing 'git diff' and 'git blame'.
+Any paths given on the command line will be passed on to 'git diff'.
+The 'git blame' command runs on the revs "$(git merge-base HEAD <upstream>)..HEAD".
+
+Examples:
+  git absorb origin/main
+  git absorb -r origin/main
+"""
+import argparse
+import io
+import re
+import subprocess
+import sys
+from collections import namedtuple
+
+RevInfo = namedtuple(
+    "RevInfo",
+    [
+        "sha1",  # Full sha1
+        "short_sha1",  # Short sha1
+        "summary",  # Commit text summary
+        # Full sha1 of the commit this one fixes, e.g. after resolving 'fixup!' etc.
+        # Defaults to the same as 'sha1'.
+        "fixes",
+    ],
+)
+
+_stripped_summary_regex = re.compile(
+    r"^\s*((fixup!|squash!)\s*)*(?P<stripped_summary>.*?)\s*$"
+)
+
+
+def get_rev_info(root_sha1):
+    log_lines = (
+        subprocess.check_output(
+            ["git", "log", "-z", "--format=%H %h %s", root_sha1 + "..HEAD"]
+        )
+        .decode("utf-8")
+        .split("\0")
+    )
+    summary_to_sha1 = {}
+    rev_infos = []
+    parsed_log_lines = [
+        log_line.split(" ", 2) for log_line in log_lines if log_line != ""
+    ]
+    for sha1, short_sha1, summary in reversed(parsed_log_lines):
+        stripped_summary = _stripped_summary_regex.match(summary).group(
+            "stripped_summary"
+        )
+        fixes = summary_to_sha1.setdefault(stripped_summary, sha1)
+        rev_infos.append(
+            RevInfo(sha1=sha1, short_sha1=short_sha1, summary=summary, fixes=fixes)
+        )
+    rev_infos.reverse()
+    return rev_infos
+
+
+def load_blame_data(repo_root, root_sha1, file_name):
+    blame_text = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            repo_root,
+            "blame",
+            "--porcelain",
+            root_sha1 + "..HEAD",
+            "--",
+            file_name,
+        ]
+    ).decode("utf-8")
+
+    ret = []
+    state = "get-sha1"
+    for line in blame_text.splitlines():
+        if state == "get-sha1":
+            sha1 = line[0:40]
+            assert re.match("^[0-9a-f]{40}$", sha1)
+            state = "get-code"
+        elif state == "get-code":
+            if line[0] == "\t":
+                code = line[1:]
+                ret.append((sha1, code))
+                state = "get-sha1"
+        else:
+            assert False, state
+    assert state == "get-sha1"
+    return ret
+
+
+def handle_file_diff(repo_root, root_sha1, sha1_map, diff_text):
+    diff_lines = diff_text.split("\n")
+    if diff_lines[-1] == "":
+        del diff_lines[-1]
+    pos = 0
+    assert len(diff_lines) >= 3, diff_text
+    assert diff_lines[pos].startswith("diff --git "), diff_lines[pos]
+    filea, fileb = diff_lines[pos][11:].split()
+    assert filea.startswith("a/"), diff_lines[pos]
+    assert fileb.startswith("b/"), diff_lines[pos]
+    file_name = filea[2:]
+    pos += 1
+    if diff_lines[pos].startswith("old mode 100") and diff_lines[pos + 1].startswith(
+        "new mode 100"
+    ):
+        old_mode = diff_lines[pos][9:]
+        new_mode = diff_lines[pos + 1][9:]
+        sys.stderr.write(
+            "Skipping %s mode change %s -> %s\n" % (file_name, old_mode, new_mode)
+        )
+        pos += 2
+        if pos == len(diff_lines):
+            return file_name, {}
+    if diff_lines[pos].startswith("index "):
+        pos += 1
+    assert len(diff_lines) >= pos + 3, diff_text
+    assert diff_lines[pos] == "--- " + filea, diff_lines[pos]
+    pos += 1
+    assert diff_lines[pos] == "+++ " + fileb, diff_lines[pos]
+    pos += 1
+    if (
+        diff_lines[pos] == "@@ -1 +1 @@"
+        and diff_lines[pos + 1].startswith("-Subproject commit ")
+        and diff_lines[pos + 2].startswith("+Subproject commit ")
+    ):
+        sys.stderr.write("Skipping submodule %s\n" % file_name)
+        return file_name, {}
+
+    blame_lines = load_blame_data(repo_root, root_sha1, file_name)
+
+    sha1_to_diff = {}
+    while pos < len(diff_lines):
+        assert diff_lines[pos].startswith("@@ "), diff_lines[pos]
+        idx = diff_lines[pos].find(" @@", 3)
+        assert idx != -1, diff_lines[pos]
+        linenumsstr = diff_lines[pos][3:idx]
+        linenumsa, linenumsb = linenumsstr.split()
+        assert linenumsa[0] == "-", diff_lines[pos]
+        assert linenumsb[0] == "+", diff_lines[pos]
+        if "," not in linenumsa:
+            linenumsa += ",0"
+        if "," not in linenumsb:
+            linenumsb += ",0"
+        start_a, count_a = map(int, linenumsa[1:].split(","))
+        start_b, count_b = map(
+            int, linenumsb[1:].split(",")
+        )  # pylint: disable=unused-variable
+        end_a = start_a + count_a
+
+        num_added = 0
+        num_removed = 0
+        chunk_start_pos = pos
+        pos += 1
+        while count_a > 0 or count_b > 0:
+            diff_line = diff_lines[pos]
+            if diff_line[0] == " ":
+                count_a -= 1
+                count_b -= 1
+            elif diff_line[0] == "-":
+                count_a -= 1
+                num_removed += 1
+            elif diff_line[0] == "+":
+                count_b -= 1
+                num_added += 1
+            else:
+                assert False, diff_line
+            pos += 1
+
+        blame_sha1s = {
+            sha1_map.get(sha1, sha1) for sha1, code in blame_lines[start_a:end_a]
+        }
+        blame_sha1s.discard(root_sha1)
+        if len(blame_sha1s) == 1:
+            blame_sha1 = blame_sha1s.pop()
+            if blame_sha1 not in sha1_to_diff:
+                sha1_to_diff[
+                    blame_sha1
+                ] = """\
+diff --git a/{file_name} b/{file_name}
+--- a/{file_name}
++++ b/{file_name}
+""".format(
+                    file_name=file_name
+                )
+            sha1_to_diff[blame_sha1] += "".join(
+                line + "\n" for line in diff_lines[chunk_start_pos:pos]
+            )
+        else:
+            sys.stderr.write(
+                "Skipping %s @@ %s @@ %s\n"
+                % (file_name, linenumsstr, sorted(sha1[0:10] for sha1 in blame_sha1s))
+            )
+    return file_name, sha1_to_diff
+
+
+def process_diff(repo_root, root_sha1, sha1_map, diff_text):
+    end_idx = 0
+    rev_to_patches = {}
+    while end_idx != len(diff_text):
+        start_idx = end_idx
+        end_idx = diff_text.find("\ndiff --git ", start_idx) + 1
+        if end_idx == 0:
+            end_idx = len(diff_text)
+        diff_part = diff_text[start_idx:end_idx]
+        file_name, sha1_to_diff = handle_file_diff(
+            repo_root, root_sha1, sha1_map, diff_part
+        )
+        for sha1, file_diff in sha1_to_diff.items():
+            rev_to_patches.setdefault(sha1, []).append((file_name, file_diff))
+    return rev_to_patches
+
+
+def apply_patches(root_sha1, rev_infos, rev_to_patches):
+    rev_sha1s = {rev_info.sha1 for rev_info in rev_infos}
+    assert set(rev_to_patches.keys()).issubset(rev_sha1s), (
+        set(rev_to_patches.keys()) - rev_sha1s
+    )
+
+    for rev_info in reversed(rev_infos):
+        if rev_info.sha1 in rev_to_patches:
+            sys.stderr.write(
+                "Patching %s %s\n" % (rev_info.short_sha1, rev_info.summary)
+            )
+            patch_parts = []
+            for file_name, file_diff in sorted(rev_to_patches[rev_info.sha1]):
+                sys.stderr.write("  %s\n" % file_name)
+                patch_parts.append(file_diff)
+            commit_patch(rev_info.sha1, "".join(patch_parts))
+
+
+def commit_patch(fixup_rev, patch):
+    # Apply the patch
+    p = subprocess.Popen(["git", "apply", "--cached"], stdin=subprocess.PIPE)
+    p.stdin.write(patch.encode("utf-8"))
+    p.stdin.close()
+    p.wait()
+    if p.returncode != 0:
+        sys.stderr.write("Problems patching %s\n" % fixup_rev)
+        raise subprocess.CalledProcessError(p.returncode, p.args)
+    # Commit
+    subprocess.check_call(
+        ["git", "commit", "--quiet", "--no-verify", "--fixup", fixup_rev]
+    )
+
+
+def main(sysargs):
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "--rebase",
+        "-r",
+        action="store_true",
+        help="""On success, run 'git rebase --autosquash --interactive'.""",
+    )
+    parser.add_argument(
+        "--no-interactive",
+        dest="rebase_interactive",
+        action="store_false",
+        help="""When rebasing, skip the --interactive flag.""",
+    )
+    parser.add_argument(
+        "upstream",
+        metavar="<upstream>",
+        help="""Upstream branch to compare against. May be any valid commit,
+not just an existing branch name.""",
+    )
+    parser.add_argument(
+        "paths",
+        metavar="<path>",
+        default=[],
+        nargs=argparse.REMAINDER,
+        help="""The <paths> parameters, when given, are used to limit the diff
+to the named paths (you can give directory names and get diff for all files
+under them).""",
+    )
+
+    # Parse parameters
+    args = parser.parse_args(sysargs[1:])
+
+    # Just doing the simplest way to handle subprocess errors.
+    # The subprocesses should write error messages themselves, so just inform
+    # what command was tried to be executed.
+    try:
+        exit_code = doit(args)
+    except subprocess.CalledProcessError as e:
+        sys.stdout.flush()
+        sys.stderr.write('Error running "%s"\n' % " ".join(e.cmd))
+        exit_code = e.returncode
+    return exit_code
+
+
+def doit(args):
+    exit_code = subprocess.call(
+        ["git", "diff", "--cached", "--quiet", "--"] + args.paths
+    )
+    if exit_code != 0:
+        sys.stderr.write(
+            "The index is not empty." " Please commit before running this command.\n"
+        )
+        sys.exit(2)
+
+    root_sha1 = (
+        subprocess.check_output(["git", "merge-base", "HEAD", args.upstream])
+        .decode("utf-8")
+        .strip()
+    )
+    rev_infos = get_rev_info(root_sha1)
+    sha1_map = {rev_info.sha1: rev_info.fixes for rev_info in rev_infos}
+
+    diff_text = subprocess.check_output(
+        ["git", "diff", "--binary", "-p", "--diff-filter=M", "--"] + args.paths
+    ).decode("utf-8")
+    if diff_text == "":
+        sys.stderr.write("Diff is empty, nothing to do.\n")
+    else:
+        repo_root = (
+            subprocess.check_output(["git", "rev-parse", "--show-cdup"])
+            .decode("utf-8")
+            .strip()
+        )
+        rev_to_patches = process_diff(repo_root, root_sha1, sha1_map, diff_text)
+        if len(rev_to_patches) == 0:
+            sys.stderr.write(
+                "No clean match between diff and blame was found,"
+                " nothing to patch.\n"
+            )
+        else:
+            apply_patches(root_sha1, rev_infos, rev_to_patches)
+            if not args.rebase:
+                sys.stderr.write('Done. Time to run "git rebase --autosquash".\n')
+
+    if args.rebase:
+        cmd = ["git", "rebase", "--autosquash"]
+        if args.rebase_interactive:
+            cmd.append("--interactive")
+        cmd += [root_sha1]
+        sys.stderr.write('Running "%s"\n' % " ".join(cmd))
+        exit_code = subprocess.call(cmd)
+    else:
+        exit_code = 0
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
