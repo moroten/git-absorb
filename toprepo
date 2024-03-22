@@ -1,0 +1,1467 @@
+#!/user/bin/env python3
+"""
+toprepo merges subrepositories into a common history, similar to git-subtree.
+
+The basic idea is to join all the history from all the subrepositories
+in a reproducible way. This means that users can keep a mono repository
+locally on their computers but have share commit hashes with everyone else.
+
+Consider the following history and commits:
+
+    Top repo  A---B---C---D-------E---F---G---H
+                  |       |       |       |
+    Submodule 1---2-------3---4---5---6---7---8
+
+The merged history will look like:
+
+    Mono repo A---B2---C2---D3--E5---F5--G7--H7
+                  /          \  /     \  / \\
+                 1            D4       F6   G8
+
+... and NOT like:
+
+    BAD REPO  A--B2--C2--D3--D4--E5--F5--G7--H7
+                 /\      /         \    /     \\
+                1  ------            E6       H8
+
+The algorithm steps are:
+* Any history before the submodule is added contains the submodule
+  directory only (1).
+* Empty edge for the submodule history are removed (2---3).
+  Such empty edges would only pollute the graph.
+  The mono repo history for the submodule directory would
+  show there is no update between the two commits anyway.
+* The top repo will keep the "first parent" line (D3---E5).
+  D4 might not be buildable and would break
+  `git bisect --first-parent`.
+* Submodule changes are moved as late as possible before merging (F6).
+  The alternative of E6 instead of F6 clutters a graph log view.
+  From the top repo view, it is impossible to know if E6 or F6
+  is better (buildable) or not.
+* Unmerged submodule branches are branched as early as possible.
+  It is easier to run `git checkout G8 && git rebase H7` than
+  `git checkout H8 && git rebase H7 --onto G7`.
+* Unmerged submodule branches are branched from the history of HEAD.
+  As commit 7 can be used in multiple top repo branches,
+  it is impossible to know which branch commit 8 is aimed for.
+  Simply checkout a different monorepo branch and run `toprepo refilter`
+  to move unmerged submodule branches around.
+
+=== Configuration ===
+
+Configuration files are stored in the root directory on the reference
+`refs/toprepo-config` in the top repo. To simplify verification of
+configuration changes, a .toprepo directory in the worktree will be
+read instead if it exists.
+
+The file `missing-commits` contains lines with
+`<commit hash> SP <raw url> LF` where the `raw url` is referring to the URL
+written in the .gitmodules file. Lines starting with `#` are ignored.
+Commits listed in these files are not expanded when converting to a
+mono repo.
+
+The file `config` is on git-config format and is overridden by values
+found with `git config --list`. The following configurations are available:
+
+* `toprepo.role`: A named role to use. Defaults to 'default'.
+* `toprepo.role.<role>.repos`: Tells which sub repos to use.
+  Multiple values are accumulated.
+  Each value starts with '+' or '-' followed by a regexp that should match a
+  whole repository name. The last matching regex decides whether the repo
+  should be expanded or not.
+  `toprepo.role.default.repos` defaults to `+.*`.
+* `toprepo.repo.<repo-id>.url`: Repositories with this specified URL in the
+  .gitmodules file will use the configuration under `repo-id`.
+  Multiple values are allowed, but only the first one will be used when
+  connecting upstream.
+* `toprepo.repo.<repo-id>.name`: The name used when identifying
+  this repository, e.g. in configured roles and the storage directory.
+* `toprepo.repo.<repo-id>.fetchUrl`: Overrides `toprepo.repo.<repo-id>.url`
+  for clone and fetch.
+* `toprepo.repo.<repo-id>.pushUrl`: Overrides `toprepo.repo.<repo-id>.fetchUrl`
+  for push.
+"""
+import argparse
+import itertools
+import logging
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass
+from functools import partial
+from pathlib import Path, PurePath, PurePosixPath
+from queue import PriorityQueue
+from typing import (
+    Callable,
+    DefaultDict,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+    overload,
+)
+
+try:
+    import git_filter_repo
+except ImportError:
+    print("ERROR: git-filter-repo is missing")
+    print("Please run:  pip3 install git-filter-repo")
+    sys.exit(2)
+
+
+logger = logging.getLogger(__file__)
+
+RefStr = str
+Ref = bytes
+TreeHash = bytes
+CommitHash = bytes
+RepoFilterId = Union[int, CommitHash]
+
+
+class Repo:
+    def __init__(self, repo: Path):
+        self.path: Path = repo
+        self.git_dir: Path = determine_git_dir(repo)
+
+
+TOP_NAME = "top"
+
+
+class TopRepo(Repo):
+    is_top = True
+    name = TOP_NAME
+
+
+@dataclass
+class PushRefSpec:
+    local_ref: RefStr
+    remote_ref: RefStr
+
+    @staticmethod
+    def parse(refspec):
+        if refspec.count(":") == 0:
+            if not refspec.startswith("refs/"):
+                refspec = "refs/heads/" + refspec
+            refspec = f"{refspec}:{refspec}"
+        if refspec.count(":") != 1:
+            raise ValueError(f"Multiple ':' found in refspec {refspec}")
+        local_ref, remote_ref = refspec.split(":")
+        return PushRefSpec(local_ref, remote_ref)
+
+
+@dataclass
+class PushInstruction:
+    repo: Repo
+    commit_hash: str
+    extra_args: List[str]
+
+    def same_but_commit(self, other: "PushInstruction"):
+        return self.repo.path == other.repo.path and self.extra_args == other.extra_args
+
+
+def try_relative_path(path: Path, other: Path = Path.cwd()) -> Path:
+    """Returns a relative path, if possible."""
+    try:
+        return path.relative_to(other)
+    except ValueError:
+        return path
+
+
+def determine_git_dir(repo: Path) -> Path:
+    git_dir_bytes = git_filter_repo.GitUtils.determine_git_dir(
+        str(repo).encode("utf-8")
+    )
+    return Path(git_dir_bytes.decode("utf-8"))
+
+
+@dataclass
+class GitModuleInfo:
+    name: str
+    path: PurePosixPath
+    branch: Optional[str]
+    url: str
+    raw_url: str
+
+
+def get_gitmodules_info(repo: Repo, ref: str) -> List[GitModuleInfo]:
+    dot_gitmodules_content = subprocess.check_output(
+        repo.path,
+        ["show", f"{ref}:.gitmodules"],
+    )
+    minified_gitmodules = subprocess.check_output(
+        repo.path,
+        ["config", "--file", "-", "--list"],
+        input=dot_gitmodules_content,
+    ).decode("utf-8")
+    return parse_gitmodules_content(repo.url, minified_gitmodules)
+
+
+def parse_gitmodules_content(
+    parent_url: str, minified_gitmodules_config: str
+) -> List[GitModuleInfo]:
+    """Parses the output from 'git config --list --file .gitmodules'."""
+    lines = minified_gitmodules_config.splitlines(keepends=False)
+    config_dicts: DefaultDict[str, Dict[str, str]] = defaultdict(dict)
+    submod_prefix = "submodules."
+    for line in lines:
+        if line.startswith(submod_prefix):
+            key, value = line[len(submod_prefix) :].split("=", 1)
+            name, field = key.rsplit(".", 2)
+            if config_dicts[name].setdefault(field, value) != value:
+                raise ValueError(
+                    "Conflicting values {line} and {config_dict[name][field]}"
+                )
+
+    configs: Dict[PurePosixPath, GitModuleInfo] = {}
+    for name, config_dict in config_dicts.items():
+        resolved_url = join_submodule_url(parent_url, config_dict["url"])
+        submod_info = GitModuleInfo(
+            name=name,
+            path=PurePosixPath(config_dict["path"]),
+            branch=config_dict.get("branch"),
+            url=resolved_url,
+            raw_url=config_dict["url"],
+        )
+        if submod_info.path in configs:
+            raise ValueError("Duplicated submodule configs for {submod_info.path}")
+        configs[submod_info.path] = submod_info
+
+    return list(configs.values())
+
+
+def join_submodule_url(parent: str, other: str) -> str:
+    if other.startswith("./") or other.startswith("../"):
+        if "//" in other:
+            raise ValueError(f"'//' not allowed in {other!r} (parent={parent!r})")
+        scheme, parent = parent.split("://", 1)
+        parent = parent.rstrip("/")
+        while True:
+            if other.startswith("./"):
+                other = other[2:]
+            elif other.startswith("../"):
+                idx = parent.rfind("/")
+                if idx == -1:
+                    raise ValueError(f"Too many '..' in {other!r} (parent={parent!r})")
+                parent = parent[:idx]
+                other = other[3:]
+            else:
+                break
+        ret = f"{scheme}://{parent}/{other}"
+    else:
+        ret = other
+    return ret
+
+
+def resolve_fetch_remote(repo: Repo, remote: str) -> Tuple[Repo, str]:
+    if "://" in remote:
+        url = remote
+    else:
+        url = subprocess.check_output(
+            ["git", "-C", str(repo.path), "config", f"remote.{remote}.url"],
+            text=True,
+        ).rstrip("\n")
+    return url
+
+
+def repository_basename(repository: str) -> str:
+    # Either if it is an URL or file path, assume a limited set of separators.
+    idx = max(repository.rfind(sep) for sep in r"/\:")
+    if idx == -1:
+        # Use the whole name then.
+        idx = 0
+    basename = repository[idx:]
+    basename = basename.removesuffix(".git")
+    return basename
+
+
+ANNOTATED_TOP_NAME = b"<top>"
+
+
+def annotate_message(
+    message: bytes, name: bytes, orig_commit_hash: CommitHash
+) -> bytes:
+    ret = message
+    if not message.endswith(b"\n"):
+        ret += b"\n"
+    ret += b"^-- " + name + b" " + orig_commit_hash + "b\n"
+    return ret
+
+
+def try_parse_top_hash_from_message(message: bytes) -> Optional[CommitHash]:
+    return try_parse_commit_hash_from_message(message, ANNOTATED_TOP_NAME)
+
+
+def try_parse_commit_hash_from_message(
+    message: bytes, name: str
+) -> Optional[CommitHash]:
+    name_bytes = name.encode("utf-8")
+    hash_annotation_regex = rb"^\^-- %s ([0-9a-f]+)$" % name_bytes
+    matches = list(re.finditer(hash_annotation_regex, message, re.MULTILINE))
+    if len(matches) == 0:
+        return None
+    elif len(matches) > 1:
+        raise ValueError(f"Multiple hashes found for {name} in the message {message}")
+    else:
+        (match,) = matches
+    top_commit_hash = match.group(1)
+    return top_commit_hash
+
+
+def try_get_topic_from_message(message: bytes) -> Optional[str]:
+    message_str = message.decode("utf-8")
+    topic_regex = r"^Topic: (\$+)$"
+    matches = list(re.finditer(topic_regex, message_str, re.MULTILINE))
+    if len(matches) == 0:
+        return None
+    if len(matches) > 1:
+        raise ValueError(
+            "Expected a single footer 'Topic: <topic>' " + "in the message {message}"
+        )
+    (match,) = matches
+    topic = match.group(1)
+    return topic
+
+
+def log_run_git(
+    repo: Optional[Path],
+    args: List[str],
+    check=True,
+    dry_run=False,
+    log_command=True,
+    **kwargs,
+) -> Optional[subprocess.CompletedProcess]:
+    """Log the git command and run it for the correct repo."""
+    full_args: List[str]
+    if repo is None:
+        full_args = ["git"] + args
+    else:
+        full_args = ["git", "-C", str(repo)] + args
+    cmdline = subprocess.list2cmdline(full_args)
+    if dry_run:
+        print(f"\rWould run  {cmdline}")
+        ret = None
+    else:
+        if log_command:
+            print(f"\rRunning   {cmdline}")
+        ret = subprocess.run(full_args, check=check, **kwargs)
+    return ret
+
+
+def ref_exists(repo: Repo, ref: str):
+    result = subprocess.run(
+        ["git", "-C", str(repo.path), "show-ref"] + ["--verify", "--quiet", "--", ref],
+        check=False,
+    )
+    if result.returncode == 1:
+        return False
+    else:
+        result.check_returncode()
+        return True
+
+
+class IgnoredCommits(defaultdict[str, Set[CommitHash]]):
+    @overload
+    def __init__(self) -> None:
+        super().__init__(set)
+
+    def __init__(self, __map: "IgnoredCommits") -> None:
+        super().__init__(set, __map)
+
+    @staticmethod
+    def from_bytes(content: bytes) -> "IgnoredCommits":
+        """Read missing commits from bytes.
+
+        Each line in file_path contains "<commit-hash> <submodule-path>".
+        Empty lines and lines starting with # are ignored.
+        """
+        ret = IgnoredCommits()
+        for line in content.splitlines(keepends=False):
+            if line == "" or line.startswith(b"#"):
+                continue
+            commit_hash_bytes, url_bytes = line.split(b" ", 1)
+            url = url_bytes.decode("utf-8")
+            ret[url].add(CommitHash(commit_hash_bytes))
+        return ret
+
+
+class ConfigParsingError(RuntimeError):
+    pass
+
+
+class RepoConfig:
+    id: str
+    """Identifier in the git-config."""
+    name: str
+    """Name of the storage directory and used for pattern matching."""
+    enabled: bool
+    """Flags if this repos should be expanded or not."""
+    raw_urls: List[str]
+    """Exact matching against sub repos configs like .gitmodules.
+
+    These URLs are not resolved any may be relative.
+    """
+    fetch_url: str
+    """Absolute URL to git-fetch from."""
+    push_url: str
+    """Absolute URL to git-push to."""
+
+
+@dataclass
+class Config:
+    missing_commits: IgnoredCommits
+    """Ignored because they are missing.
+
+    A warning will be issued if the commit suddenly turns up.
+    """
+
+    repos: List[RepoConfig]
+    raw_url_to_repos: Dict[str, List[RepoConfig]]
+
+    @staticmethod
+    def create(toprepo: Repo) -> "Config":
+        read_bytes = Config.get_file_reader(toprepo)
+
+        try:
+            missing_commits = IgnoredCommits.from_bytes(read_bytes("missing-commits"))
+        except RuntimeError as err:
+            raise ConfigParsingError(f"Invalid 'missing-commits' file: {err}")
+
+        try:
+            config_bytes = read_bytes("config")
+        except RuntimeError as err:
+            raise ConfigParsingError(f"Invalid 'config' file: {err}")
+        config = (
+            subprocess.check_output(
+                ["git", "config", "--list", "--file", "-"],
+                input=config_bytes,
+            )
+            + subprocess.check_output(
+                ["git", "-C", str(toprepo), "config", "--list"],
+            )
+        ).decode("utf-8")
+
+        config_dict: DefaultDict[str, List[str]] = defaultdict(list)
+        repo_config_dicts: DefaultDict[str, DefaultDict[str, List[str]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        for line in config.splitlines(keepends=False):
+            key, value = line.split("=", 1)
+            config_dict[key].append(value)
+            # Accumulate toprepo.repo.<id>.* keys.
+            repo_config_prefix = "toprepo.repo."
+            if key.startswith(repo_config_prefix) and key.count(".") == 3:
+                _, _, repo_id, subkey = key.split(".", 3)
+                repo_config_dicts[repo_id][subkey].append(value)
+        # Resolve the role.
+        config_dict.setdefault("toprepo.role.default.repos", ["+.*"])
+        role = config_dict.get("toprepo.role", ["default"])[-1]
+        wanted_repos_patterns = config_dict.setdefault(f"toprepo.role.{role}.repos", [])
+        top_url = config_dict.get("remote.origin.url", None)[-1]
+        top_fetch_url = config_dict.get("remote.origin.fetchUrl", [top_url])[-1]
+        top_push_url = config_dict.get("remote.origin.pushUrl", [top_url])[-1]
+        repo_configs = Config.parse_repo_configs(
+            top_fetch_url,
+            top_push_url,
+            repo_config_dicts,
+            wanted_repos_patterns,
+        )
+        # Map URL to RepoConfig.
+        raw_url_to_repos: DefaultDict[str, List[RepoConfig]] = defaultdict(list)
+        for repo_config in repo_configs:
+            for raw_url in repo_config.raw_urls:
+                raw_url_to_repos[raw_url].append(repo_config)
+        return Config(
+            missing_commits=missing_commits,
+            repos=repo_configs,
+            raw_url_to_repos=raw_url_to_repos,
+        )
+
+    @staticmethod
+    def get_file_reader(toprepo: Repo) -> Callable[[Path], bytes]:
+        config_ref = "refs/toprepo-config"
+        # If the user has a config written for testing, use that.
+        if (toprepo.path / ".toprepo").is_dir():
+            ls_tree_output = subprocess.check_output(
+                ["git", "-C", str(toprepo.path)]
+                + ["ls-files", config_ref, "--", ".toprepo"],
+            )
+            if ls_tree_output != b"":
+                raise ConfigParsingError(
+                    "Do not commit your temporary .toprepo directory"
+                )
+            print("INFO: Reading temporary config from .toprepo directory")
+
+            def file_reader(path: Path):
+                return (toprepo.path / ".toprepo" / path).read_bytes()
+
+        elif ref_exists(toprepo, config_ref):
+            # Read from specific refs instead.
+            def file_reader(path: Path):
+                return subprocess.check_output(
+                    ["git", "-C", str(toprepo.path)]
+                    + ["show", "HEAD:" + path.as_posix()],
+                )
+
+        else:
+            # Ref is missing
+            def file_reader(path: Path):
+                return b""
+
+        return file_reader
+
+    @staticmethod
+    def parse_repo_configs(
+        repo_config_dicts: Dict[str, Dict[str, List[str]]],
+        wanted_repos_patterns: List[str],
+        parent_fetch_url: str,
+        parent_push_url: str,
+    ) -> List[RepoConfig]:
+        repo_configs: List[RepoConfig] = []
+        repo_name_to_id: Dict[str, str] = set()
+        for repo_id, repo_config_dict in repo_config_dicts.items():
+            repo = Config.parse_repo_config(
+                repo_id,
+                repo_config_dict,
+                wanted_repos_patterns,
+                parent_fetch_url,
+                parent_push_url,
+            )
+            other_id = repo_name_to_id.setdefault(repo.name, repo.id)
+            if other_id != repo.id:
+                raise ConfigParsingError(
+                    f"Repo name {repo.name} is used for "
+                    + f"both id {repo.id} and {other_id}"
+                )
+            repo_configs.append(repo)
+        return repo_configs
+
+    @staticmethod
+    def parse_repo_config(
+        repo_id: str,
+        repo_config_dict: Dict[str, List[str]],
+        wanted_repos_patterns: List[str],
+        parent_fetch_url: str,
+        parent_push_url: str,
+    ) -> RepoConfig:
+        name = repo_config_dict.get("name", [None])[-1]
+        if name is None:
+            raise ConfigParsingError(f"toprepo.repo.{repo_id}.name is unspecified")
+        if name == TOP_NAME or len(PurePosixPath(name).parts) != 1:
+            raise ConfigParsingError(f"Invalid repo name {name}")
+        wanted_flag = Config.repo_is_wanted(name, wanted_repos_patterns)
+        if wanted_flag is None:
+            raise ConfigParsingError(
+                f"Could not determine if repo {name} is wanted or not"
+            )
+        raw_urls = repo_config_dict.get("url")
+        if raw_urls is None:
+            raise ConfigParsingError(f"toprepo.repo.{repo_id}.url is unspecified")
+        raw_fetch_url = repo_config_dict.get("fetchUrl", [None])[-1]
+        if raw_fetch_url is None:
+            raw_urls_set = set(raw_urls)
+            if len(raw_urls_set) != 1:
+                raise ConfigParsingError(
+                    f"Missing toprepo.repo.{repo_id}.fetchUrl and multiple "
+                    + f"toprepo.repo.{repo_id}.url gives an ambiguous defult"
+                )
+            raw_fetch_url = raw_urls_set.pop()
+        try:
+            fetch_url = join_submodule_url(parent_fetch_url, raw_fetch_url)
+        except ValueError as err:
+            raise ConfigParsingError(
+                f"Invalid toprepo.repo.{repo_id}.fetchUrl=" + f"{raw_fetch_url}: {err}"
+            )
+        raw_push_url = repo_config_dict.get("pushUrl", [raw_fetch_url])[-1]
+        try:
+            push_url = join_submodule_url(parent_push_url, raw_push_url)
+        except ValueError as err:
+            raise ConfigParsingError(
+                f"Invalid toprepo.repo.{repo_id}.pushUrl=" + f"{raw_push_url}: {err}"
+            )
+        return RepoConfig(
+            id=repo_id,
+            name=name,
+            enabled=wanted_flag,
+            raw_urls=raw_urls,
+            fetch_url=fetch_url,
+            push_url=push_url,
+        )
+
+    @staticmethod
+    def repo_is_wanted(name: str, wanted_repos_patterns: List[str]) -> bool:
+        wanted = None
+        for pattern in wanted_repos_patterns:
+            if pattern[0] not in "+-":
+                raise ConfigParsingError(
+                    f"Invalid wanted repo config {pattern} for {name}, "
+                    + "should start with '+' or '-' followed by a regex."
+                )
+            try:
+                if re.match(pattern[1:], name) is not None:
+                    wanted = pattern[0] == "+"
+            except RuntimeError as err:
+                raise ConfigParsingError(
+                    f"Invalid wanted repo regex {pattern[1:]} " + f"for {name}: {err}"
+                )
+        return wanted
+
+
+class DevNullWriter:
+    def write(self, bytes):
+        pass
+
+
+class DevNullOutputRepoFilter:
+    """Defines an output pipe for RepoFilter which discards all data."""
+
+    def __init__(self):
+        self._output = DevNullWriter()
+        self._import_pipes = None
+
+
+class SubRepo(Repo):
+    is_top = False
+
+    def __init__(self, config: RepoConfig, repo: Path):
+        super().__init__(repo=repo)
+        self.config = config
+
+    @property
+    def name(self):
+        name = self.config.name
+        assert name != TOP_NAME, f"Bad name {name}"
+        return name
+
+
+class CommitMap:
+    def __init__(self):
+        self.id_to_commit: Dict[int, git_filter_repo.Commit] = {}
+        """Maps a unique git-filter-repo id to a commit."""
+
+        self.hash_to_commit: Dict[CommitHash, git_filter_repo.Commit] = {}
+        """Maps from a commit hash to a commit."""
+
+    @staticmethod
+    def join(commit_maps: Iterable["CommitMap"]) -> "CommitMap":
+        ret = CommitMap()
+        for commit_map in commit_maps:
+            ret.id_to_commit.update(commit_map.id_to_commit)
+            ret.hash_to_commit.update(commit_map.hash_to_commit)
+        return ret
+
+    @staticmethod
+    def collect_tree_hashes(repo: Repo) -> Dict[CommitHash, TreeHash]:
+        """Get all commit hashes and map to tree hashes in a repo."""
+        result = subprocess.check_output(
+            ["git", "-C", str(repo.path)] + ["log", "--format=%H %T", "--all", "--"]
+        )
+        commit_to_tree: Dict[CommitHash, TreeHash] = {}
+        for line in result.stdout.splitlines(keepends=False):
+            commit_hash, tree_hash = line.split(b" ", 1)
+            commit_to_tree[commit_hash] = tree_hash
+        return commit_to_tree
+
+    @staticmethod
+    def collect_commits(repo: Repo) -> "CommitMap":
+        """Loads metadata about all commits."""
+        ret = CommitMap()
+        commit_to_tree = ret.collect_tree_hashes(repo)
+
+        args = git_filter_repo.FilterOptions.parse_args(
+            ["--partial", "--refs", "dummy"]
+            + ["--source", str(repo.path)]
+            # --target must be the same as --source but is overridden later.
+            + ["--target", str(repo.path)]
+        )
+        args.refs = ["--all"]
+        filter = git_filter_repo.RepoFilter(
+            args,
+            commit_callback=partial(ret._collect_commit_callback, commit_to_tree),
+        )
+        filter.set_output(DevNullOutputRepoFilter())
+        filter.run()
+        return ret
+
+    def _collect_commit_callback(self, commit_to_tree, commit, metadata):
+        commit.depth = 1 + max(
+            (
+                self.id_to_commit[parent_id].depth
+                for parent_id in commit.parents
+                if isinstance(parent_id, int)
+            ),
+            default=0,
+        )
+        self.id_to_commit[commit.id] = commit
+        self.hash_to_commit[commit.original_id] = commit
+        commit.tree_hash = commit_to_tree[commit.original_id]
+
+
+@dataclass
+class Remote:
+    url: str
+    name: str
+
+
+@dataclass(frozen=True)
+class BumpInfo:
+    subrepo_commit: git_filter_repo.Commit
+    """The original commit from the sub repo."""
+
+    mono_commit: git_filter_repo.Commit
+    """The commit in the mono repo that updates the sub directory content,
+    i.e. the translated top repo commit which did contain a bump of
+    the sub repo compared to any parent.
+
+    This variable is used to fast track searches through the first-parent
+    chain.
+    """
+
+
+class SubmoduleFilter:
+    def __init__(self, repo: Repo):
+        self.submodule_configs: Optional[Dict[bytes, GitModuleInfo]] = None
+        """Set to None to reload from .gitmodules when needed."""
+
+        self.repo = repo
+
+    def reset_callback(self):
+        self.submodule_configs = None
+
+    def commit_callback(
+        self, commit: git_filter_repo.Commit
+    ) -> List[Tuple[git_filter_repo.FileChange, Optional[GitModuleInfo]]]:
+        for file_change in commit.file_changes:
+            if file_change.filename == b".gitmodules":
+                self.submodule_configs = None
+
+        ret: List[Tuple[git_filter_repo.FileChange, Optional[GitModuleInfo]]] = []
+        for file_change in commit.file_changes:
+            submodule_mode = b"160000"
+            if file_change.mode == submodule_mode:
+                if file_change.type == b"D":
+                    ret.append((file_change, None))
+                else:
+                    if self.submodule_configs is None:
+                        # .gitmodules has changed, reload.
+                        ref = commit.original_id.decode("utf-8")
+                        self.submodule_configs = {
+                            config.path.as_posix.encode("utf-8"): config
+                            for config in get_gitmodules_info(self.repo, ref)
+                        }
+                    submod_config = self.submodule_configs.get(file_change.filename)
+                    if submod_config is not None:
+                        ret.append((file_change, submod_config))
+                    else:
+                        print(
+                            "WARNING: Unknown submodule "
+                            + file_change.decode("utf-8")
+                            + " at commit "
+                            + commit.original_id.decode("utf-8")
+                        )
+        return ret
+
+
+class ReferencedSubmodCommitsCollector:
+    def __init__(self, repo: Repo):
+        self.referenced_commits: Dict[str, Set[CommitHash]]
+        """Mapping from submodule URL to commit hashes."""
+
+        self.submodule_filter = SubmoduleFilter(repo)
+
+    def reset_callback(self, reset: git_filter_repo.Reset):
+        self.submodule_filter.reset_callback()
+
+    def commit_callback(self, commit: git_filter_repo.Commit, metadata):
+        submods = self.submodule_filter.commit_callback(commit)
+        for file_change, submodule_config in submods:
+            if submodule_config is not None:
+                url = submodule_config.url
+                self.referenced_commits[url].add(file_change.blob_id)
+
+    @staticmethod
+    def collect(repo: Repo) -> Dict[str, Set[CommitHash]]:
+        """Iterates through a repository and collects submodule commits.
+
+        Returns:
+            A mapping from submodule URL to commit hashes.
+        """
+        collector = ReferencedSubmodCommitsCollector()
+
+        args = git_filter_repo.FilteringOptions.parse_args(
+            ["--partial", "--refs", "dummy"]
+            + ["--source", str(repo.path)]
+            # --target must be the same as --source but is overridden later.
+            + ["--target", str(repo.path)]
+        )
+        args.refs = ["--all"]
+        filter = git_filter_repo.RepoFilter(
+            args,
+            commit_callback=collector.commit_callback,
+            reset_callback=collector.reset_callback,
+        )
+        filter.set_output(DevNullOutputRepoFilter())
+        filter.run()
+
+        return collector.referenced_commits
+
+
+class RepoMerger:
+    def __init__(self, toprepo: TopRepo):
+        self.toprepo = toprepo
+        self.config = Config(toprepo)
+
+        self.commit_map = defaultdict(CommitMap)
+        self.submodule_filter = SubmoduleFilter(toprepo)
+
+        self.converted_ids: Dict[RepoFilterId, RepoFilterId] = {}
+
+    def fetch_repo(self, repo: SubRepo, ref_arg: Optional[str] = None):
+        """Make all the repo content available in the toprepo.
+
+        All the blobs and trees need to be accessible within the toprepo.
+        This filtering will copy all the data over."""
+        # TODO: Skip already copied stuff from previous runs.
+        # TODO: This needs storing all the references.
+
+        # First fetch into the individual repository.
+        ref_args = [ref_arg] if ref_arg is not None else []
+        log_run_git(
+            repo.path,
+            [
+                "fetch",
+                "--quiet",
+                "--prune",
+                "--prune-tags",
+                "--tags",
+                "origin",
+            ]
+            + ref_args,
+        )
+        # Then move the blobs over to the monorepo.
+        log_run_git(
+            self.toprepo.path,
+            [
+                "fetch",
+                "--quiet",
+                "--prune",
+                str(repo.path),
+                f"+refs/*:refs/{repo.name}/",
+            ],
+        )
+
+    def filter_toprepo(self, allow_fetching: bool):
+        """Perform the toprepo filtering.
+
+        Submodules will be fetched and filtered on demand.
+        """
+        submod_commits = ReferencedSubmodCommitsCollector.collect(self.toprepo)
+        subrepos: Dict[str, SubRepo] = {}
+        for url in submod_commits.keys():
+            subrepo_configs = self.config.raw_url_to_repos.get(url)
+            if subrepo_configs is None:
+                print("ERROR: No subrepo configured for URL {url} in .toprepo config")
+                return False
+            for subrepo_config in subrepo_configs:
+                if not subrepo_config.enabled or subrepo_config.id in subrepos:
+                    continue
+                subrepo = SubRepo(
+                    subrepo_config,
+                    self.toprepo.git_dir / "toprepo/sub" / subrepo_config.name,
+                )
+                subrepos[subrepo_config.id] = subrepo
+
+        self.commit_map = self.make_commits_available(
+            list(subrepos.values()), submod_commits, allow_fetching
+        )
+        if self.commit_map is None:
+            return False
+        # TODO: Load already filtered .git/toprepo/top/toprepo-mapping
+        # TODO: Proper filter toprepo.
+        # TODO: Remove old refs.
+        raise NotImplementedError()
+
+    def make_commits_available(
+        self,
+        subrepos: List[SubRepo],
+        submod_commits: Dict[str, Set[CommitHash]],
+        allow_fetching: bool,
+    ) -> Optional[CommitMap]:
+        """Check that all wanted commits exists.
+
+        If commits are missing, run git-fetch in all the sub repos
+        associated with that URL.
+
+        Args:
+            submod_commits: A map from a raw URL to needed commit hashes.
+        """
+        fetched_repos: Set[str] = set()  # subrepo.config.id
+        commit_maps = {
+            subrepo.id: CommitMap.collect_commits(subrepo) for subrepo in subrepos
+        }
+        subrepo_map = {subrepo.id: subrepo for subrepo in subrepos}
+        all_commits_are_available = True
+
+        for url, referenced_commits in submod_commits.keys():
+            subrepos = [
+                subrepo_map[subrepo_config.id]
+                for subrepo_config in self.config.raw_url_to_repos.get(url, [])
+            ]
+            def get_commits_to_fetch() -> Set[CommitHash]:
+                """Finds what commits need to be fetched from upstream."""
+                ret: Set[CommitHash] = (
+                    referenced_commits -
+                    self.config.missing_commits.get(url, set())
+                )
+                for subrepo in subrepos:
+                    ret.difference_update(
+                        commit_maps[subrepo.config.id].hash_to_commit.keys()
+                    )
+                return ret
+
+            commits_to_fetch = get_commits_to_fetch()
+            # Fetch.
+            if len(commits_to_fetch) != 0 and allow_fetching:
+                for subrepo in subrepos:
+                    if subrepo.id not in fetched_repos:
+                        fetched_repos.add(subrepo.id)
+                        self.fetch_repo(subrepo)
+                        commit_maps[subrepo.config.id] = CommitMap.collect_commits(
+                            subrepo
+                        )
+                # Recalculate.
+                commits_to_fetch = self.get_commits_to_fetch()
+            # Check.
+            for commit_hash in sorted(commits_to_fetch):
+                if all_commits_are_available:
+                    all_commits_are_available = False
+                    print("ERROR: Some referenced commits could not be found")
+                    print(
+                        "Either push the following commits or "
+                        + "add them to the missing-commits "
+                        + "toprepo configuration."
+                    )
+                print(commit_hash.decode("utf-8") + " " + url)
+        # Don't clutter the error message above with warnings
+        # about overspecified missing-commits.
+        if all_commits_are_available:
+            overspecified_missing_commits = False
+            for url, referenced_commits in submod_commits.keys():
+                unexpected_commits = (
+                    self.config.missing_commits.get(url, set()) - referenced_commits
+                )
+                for commit_hash in sorted(unexpected_commits):
+                    if not overspecified_missing_commits:
+                        overspecified_missing_commits = True
+                        print(
+                            "WARNING: The following configured "
+                            + "missing-commits actually exists"
+                        )
+                        print(
+                            "Please remove them from the missing-commits "
+                            + "toprepo configuration."
+                        )
+                    print(commit_hash.decode("utf-8") + " " + url)
+        if not all_commits_are_available:
+            return None
+        return CommitMap.join(commit_maps.values())
+
+    def expand_toprepo(self, top_refs: List[str] = ["--all"]):
+        args = git_filter_repo.FilteringOptions.parse_args(
+            ["--partial", "--refs", "dummy"]
+            + ["--source", str(toprepo.path)]
+            + ["--target", str(monorepo.path)]
+        )
+        args.refs = top_refs
+        filter = None
+        filter = git_filter_repo.RepoFilter(
+            args,
+            reset_callback=self._expand_toprepo_reset_callback,
+            commit_callback=partial(self._expand_toprepo_commit_callback, filter),
+        )
+        filter.run()
+
+    def _expand_toprepo_reset_callback(self, reset: git_filter_repo.Reset):
+        self.submodule_filter.reset_callback()
+
+    def _expand_toprepo_commit_callback(
+        self,
+        repo_filter: git_filter_repo.RepoFilter,
+        mono_commit: git_filter_repo.Commit,
+        metadata,
+    ):
+        self.mono_id_to_commit[mono_commit.id] = mono_commit
+        first_parent_id = mono_commit.first_parent()
+        if first_parent_id is not None:
+            first_parent = self.mono_id_to_commit[first_parent_id]
+            mono_commit.bumps = dict(first_parent.bumps)  # Copy
+        else:
+            mono_commit.bumps = {}  # Dict[bytes, BumpInfo]
+
+        commit_message_parts = [
+            annotate_message(
+                mono_commit.message, ANNOTATED_TOP_NAME, mono_commit.original_id
+            )
+        ]
+
+        submods = self.submodule_filter.commit_callback(mono_commit)
+        for file_change, submodule_config in submods:
+            if file_change.type == b"M":
+                subrepo = self.get_subrepo(submodule_config.url)
+                # TODO: Get submodule info from submod_path?
+                commit_message_parts += self._expand_submod_in_commit_callback(
+                    repo_filter,
+                    subrepo,
+                    mono_commit,
+                    file_change,
+                )
+            elif file_change.type == b"D":
+                mono_commit.bumps.pop(file_change.filename)
+            elif file_change.type == b"R":
+                raise NotImplementedError("Submodule renames are not implements")
+            else:
+                assert False, f"Unknown file change type {file_change.type}"
+
+        # Check if any subrepo was bumped here.
+        for subdir, bump_info in mono_commit.bumps.items():
+            for pid in mono_commit.parents:
+                parent_bump = self.mono_id_to_commit[pid].bumps.get(subdir)
+                if (
+                    parent_bump is None
+                    or parent_bump.subrepo_commit != bump_info.subrepo_commit
+                ):
+                    # subdir was bumped.
+                    mono_commit.bumps[subdir] = BumpInfo(
+                        subrepo_commit=bump_info.subrepo_commit,
+                        mono_commit=mono_commit,
+                    )
+                    break
+
+        mono_commit.message = join_annotated_commit_messages(commit_message_parts)
+
+    def _expand_submod_in_commit_callback(
+        self,
+        repo_filter: git_filter_repo.RepoFilter,
+        subrepo: SubRepo,
+        mono_commit: git_filter_repo.Commit,
+        file_change: git_filter_repo.FileChange,
+    ) -> List[bytes]:
+        """Injects the submodule commit history up to the commit referenced by file_change.
+
+        Returns:
+            A list of annotated commit messages to attach to mono_commit.
+        """
+        commit_message_parts = []
+        submod_hash: CommitHash = file_change.blob_id
+        submod_commit = subrepo.hash_to_commit.get(submod_hash)
+        if submod_commit is not None:
+            # Swap commit to tree.
+            tree_mode = b"040000"
+            file_change.mode = tree_mode
+            file_change.blob_id = submod_commit.tree_hash
+            commit_message_parts.append(
+                annotate_message(
+                    submod_commit.message, file_change.filename, submod_hash
+                )
+            )
+            # Recreate the history of the submodule commit graph.
+            new_mono_parent_ids = self._inject_subrepo(
+                repo_filter, mono_commit, subrepo, submod_commit
+            )
+            for pid in new_mono_parent_ids:
+                if pid not in mono_commit.parents:
+                    mono_commit.parents.append(pid)
+        else:
+            # Missing commit, leave as a submodule reference.
+            pass
+
+        mono_commit.bumps[file_change.path] = BumpInfo(
+            subrepo_commit=submod_commit,
+            mono_commit=mono_commit,
+        )
+        return commit_message_parts
+
+    def _inject_subrepo(
+        self,
+        repo_filter: git_filter_repo.RepoFilter,
+        target_mono_commit: git_filter_repo.Commit,
+        subdir: bytes,
+        subrepo: SubRepo,
+        subrepo_commit_to_insert: git_filter_repo.Commit,
+    ) -> List[int]:
+        """Injects the history of subrepo_commit_to_insert into the monorepo.
+
+        subrepo_commit_to_insert refers to a commit in a sub repo that a top repo
+        commit refers to. That content is merged into the converted top commit.
+        When a sub repo is bumped, there might be a long history in the
+        sub repo that also needs to be merged. All those commits are resolved
+        and inserted here.
+        """
+        counter = itertools.count(start=0, step=1)
+
+        def bump_generator(max_subrepo_commit_depth: int):
+            mono_queue_ids: Set[int] = set()
+            mono_queue = PriorityQueue()
+            mono_queue.put((0, next(counter), target_mono_commit))
+
+            while not mono_queue.empty():
+                _, _, mono_commit = mono_queue.get()
+                bump = mono_commit.bumps.get(subdir)
+                if bump is not None:
+                    if bump.subrepo_commit.depth > max_subrepo_commit_depth:
+                        # The subrepo pointer has reversed in the history.
+                        # Stop tracing that branch, merge from the subrepo
+                        # source if needed instead.
+                        continue
+                    max_subrepo_commit_depth = bump.subrepo_commit.depth
+                    yield bump
+                    # Dig deeper.
+                    for pid in bump.mono_commit.parent_id:
+                        # Prioritize by subrepo depth, not monorepo depth.
+                        # Otherwise, we don't know when we have looked far
+                        # enough as the depths are not correlated.
+                        if pid not in mono_queue_ids:
+                            mono_queue_ids.add(pid)
+                            mono_queue.put(
+                                (
+                                    -bump.subrepo_commit.depth,
+                                    next(counter),
+                                    self.mono_id_to_commit[pid],
+                                )
+                            )
+
+        bump_iterator = bump_generator(subrepo_commit_to_insert.depth - 1)
+
+        commits_to_convert: List[git_filter_repo.Commit] = []
+        subrepo_id_to_converted_id: Dict[int, int] = {}
+
+        sub_queue_ids: Set[int] = set()
+        sub_queue = PriorityQueue()
+        sub_queue.put(
+            (-subrepo_commit_to_insert.depth, next(counter), subrepo_commit_to_insert)
+        )
+        # Get the loop going, initialize with something that
+        # gets us into the inner loop.
+        bump = BumpInfo(subrepo_commit=subrepo_commit_to_insert, mono_commit=None)
+        while not sub_queue.empty():
+            _, _, subrepo_commit = sub_queue.get()
+
+            while bump.subrepo_commit.depth >= subrepo_commit.depth:
+                # Some paths in the monorepo history has found a subrepo
+                # commit that is close to a root than subrepo_commit.
+                # Don't search further now, because the assumption is that
+                # getting closer to a monorepo root should mean closer
+                # to the subrepo root.
+                try:
+                    bump = next(bump_iterator)
+                except StopIteration:
+                    break
+                # Do not override the bump_commit that was found previously,
+                # as this loop is going back in the history and
+                # the map should point to (one of the) newest commits.
+                # There might be multiple valid solutions,
+                # so just use the first one found.
+                subrepo_id_to_converted_id.setdefault(
+                    bump.subrepo_commit.id, bump.mono_commit.id
+                )
+
+            if subrepo_commit.id not in subrepo_id_to_converted_id:
+                # No good already sub->mono converted candidate was found
+                # in the monorepo.
+                commits_to_convert.append(subrepo_commit)
+                for pid in subrepo_commit.parents:
+                    if pid not in sub_queue_ids:
+                        sub_queue_ids.add(pid)
+                        subrepo_parent = subrepo.id_to_commit[pid]
+                        sub_queue.put(
+                            (-subrepo_parent.depth, next(counter), subrepo_parent)
+                        )
+
+        # Skip subrepo_commit_to_insert itself,
+        # git-filter-repo is inserting it for us when returning.
+        assert commits_to_convert[0] == subrepo_commit_to_insert
+        for subrepo_commit in reversed(commits_to_convert[1:]):
+            new_commit = self._create_mono_commit_from_subrepo_commit(
+                subdir, subrepo, subrepo_commit
+            )
+            repo_filter.insert(new_commit, direct_insertion=True)
+            # Record subrepo trace info.
+            first_parent_id = new_commit.first_parent()
+            if first_parent_id is None:
+                new_commit.bumps = {}
+            else:
+                first_parent = self.mono_id_to_commit[first_parent_id]
+                new_commit.bumps = dict(first_parent.bumps)  # Copy
+            new_commit.bumps[subdir] = BumpInfo(
+                subrepo_commit=subrepo_commit,
+                mono_commit=new_commit,
+            )
+
+        ret = [
+            subrepo_id_to_converted_id[parent_id]
+            for parent_id in subrepo_commit_to_insert.parents
+        ]
+        return ret
+
+
+def main_init(args):
+    if args.directory is not None:
+        subdir = args.directory
+    else:
+        subdir = repository_basename(args.repository)
+    toprepo_dir: Path = args.cwd / subdir
+    if toprepo_dir.exists():
+        print(f"ERROR: {toprepo_dir} already exists")
+        return 1
+    if not toprepo_dir.parent.exists():
+        print(f"ERROR: The directory {toprepo_dir.parent} is missing")
+        return 1
+    toprepo_dir.mkdir()
+    log_run_git(toprepo_dir, ["init", "--quiet"])
+    toprepo = TopRepo(toprepo_dir)
+    log_run_git(
+        toprepo.path,
+        ["clone", "--bare", args.repository, toprepo.git_dir / "toprepo/top"],
+    )
+
+    repo_merger = RepoMerger(toprepo)
+    if not repo_merger.filter_toprepo(fetch_subrepos_on_demand=True):
+        return 1
+    print(f"Initialization of {toprepo.path} succeeded!")
+    print("Run 'toprepo fetch && git checkout origin/main' to start.")
+    return 0
+
+
+def main_refilter(args):
+    toprepo = TopRepo(args.cwd)
+    repo_merger = RepoMerger(toprepo)
+    if args.from_scratch:
+        # TODO: Remove all refs from toprepo.
+        # TODO: Clear the caches.
+        # repo_merger.clear_refs()
+        # repo_merger.clear_caches()
+        raise NotImplementedError("refilter from scratch")
+    if not repo_merger.filter_toprepo(fetch_subrepos_on_demand=False):
+        return 1
+    return 0
+
+
+def main_fetch(args):
+    toprepo = TopRepo(args.cwd)
+    orig_repo, remote = resolve_fetch_remote(toprepo, args.remote)
+    if orig_repo is None:
+        return 1
+    ref_args: List[str]
+    if args.ref is not None:
+        # Fetch ref to refs/top-fetch-head instead of FETCH_HEAD.
+        # Then there is no need for extra args to git-filter-repo to pick up FETCH_HEAD.
+        ref_args = [f"{args.ref}:refs/top-fetch-head"]
+    else:
+        # Fetch according to the git config.
+        ref_args = []
+
+    repo_merger = RepoMerger(toprepo)
+    log_run_git(
+        orig_repo.path,
+        ["fetch", "--prune", "--prune-tags", "--tags", remote] + ref_args,
+    )
+
+    if args.do_filter:
+        if not repo_merger.filter_toprepo(fetch_subrepos_on_demand=True):
+            return 1
+        if args.ref is not None:
+            # Update FETCH_HEAD.
+            fetch_head_ref = "refs/{orig_repo.name}/top-fetch-head"
+            log_run_git(toprepo.path, ["update-ref", "FETCH_HEAD", fetch_head_ref])
+    else:
+        print("Skipping monorepo filtering")
+    return 0
+
+
+def main_push(args):
+
+    raise NotImplementedError(args)
+
+
+def _parse_arguments(argv):
+    # Support pasting normal git commands to this script.
+    # For example
+    #   toprepo git fetch <server> ref
+    # should map to
+    #   toprepo fetch <server> ref
+    if len(argv) > 2 and argv[1] == "git":
+        argv.pop(1)
+
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawTextHelpFormatter,
+        prog=Path(argv[0]).name,
+    )
+    parser.add_argument(
+        "-C",
+        dest="cwd",
+        type=Path,
+        default=Path.cwd(),
+        help="Working directory, defaults to '.'.",
+    )
+    parser.set_defaults(func=None)
+    subparsers = parser.add_subparsers()
+
+    init_parser = subparsers.add_parser(
+        "init",
+        description="""\
+            Clones a top repository and initializes a mono repository in the current directory.
+        """,
+    )
+    init_parser.set_defaults(func=main_init)
+    init_parser.add_argument(
+        "repository",
+        type=str,
+        nargs=1,
+        help="""\
+            The URL to the top repository to clone,
+            i.e. the repository containing the submodules.""",
+    )
+    init_parser.add_argument(
+        "directory",
+        type=PurePath,
+        nargs="?",
+        help="""\
+            Where to initialize the repository.
+            Defaults to the base name of the repository.""",
+    )
+
+    refilter_parser = subparsers.add_parser(
+        "refilter",
+        description="Performes a refiltering of the monorepo.",
+    )
+    refilter_parser.set_defaults(func=main_refilter)
+    refilter_parser.add_argument(
+        "--from-scratch",
+        dest="from_scratch",
+        action="store_true",
+        help="""\
+            Removes previous filtering results and starts over again.
+
+            This option will remove all refs/* apart from refs/heads/*
+            and clear the caches about what commits have been filtered.
+            Performing this refiltering might generate new commit hashes
+            in the git history, if the algorithm has changed or
+            the submodule commit ignore list has been updated.""",
+    )
+
+    fetch_parser = subparsers.add_parser(
+        "fetch",
+        description="""\
+            Fetches the top repository and resolves all refs into the monorepo.
+            If any referenced submodule commit is missing,
+            the submodule will also be fetched.
+
+            FETCH_HEAD will be updated if a single ref is is specified.
+            """,
+    )
+    fetch_parser.set_defaults(func=main_fetch)
+    fetch_parser.add_argument(
+        "--skip-filter",
+        action="store_false",
+        dest="do_filter",
+        help="Fetch from the remote but skip monorepo filtering.",
+    )
+    fetch_parser.add_argument(
+        "remote",
+        type=str,
+        nargs="?",
+        help="""\
+            The URL or a submodule path to fetch from.
+            Will fetch from the top repository remote
+            if 'origin', '.' or '' is specified.""",
+    )
+    fetch_parser.add_argument(
+        "ref",
+        type=str,
+        nargs="?",
+        help="""\
+            The 'refspec' to be fetched from the specified remote.
+            If a single ref is specified,
+            FETCH_HEAD will be updated accordingly.""",
+    )
+
+    push_parser = subparsers.add_parser(
+        "push",
+        description="""\
+            Splits the monorepo into commits to push and pushes them.
+
+            'refs/heads/push' will be updated in the top repository and
+            each affected submodule.""",
+    )
+    push_parser.set_defaults(func=main_push)
+    push_parser.add_argument(
+        "--dry-run",
+        "-n",
+        action="store_true",
+        help="""\
+            Split the monorepo commits and write the git-push commands
+            that should have been executed.
+
+            Use this option to push to manually push a different repository
+            than the default configured 'origin'.""",
+    )
+    push_parser.add_argument(
+        "remote",
+        type=str,
+        nargs="?",
+        choices=["origin"],
+        help="""\
+            Unused placeholder in case the user writes 'origin'
+            on the command line, like with git-push.""",
+    )
+    push_parser.add_argument(
+        "local_and_remote_ref",
+        metavar="local-ref:remote-ref",
+        type=PushRefSpec.parse,
+        nargs=1,
+        help="""\
+            The refspec describing what to push, just like git-push.
+
+            If a single branch name is specified, it is translated into
+            'refs/heads/<branch>:refs/heads/<branch>'.""",
+        # TODO: Follow upstream settings in .git/config for the monorepo.
+    )
+
+    args = parser.parse_args(argv[1:])
+    if args.func is None:
+        parser.print_help()
+        parser.exit(status=2)
+    args.cwd = try_relative_path(args.cwd)
+    return args
+
+
+def main(argv):
+    args = _parse_arguments(argv)
+
+    mono_repo = Path(
+        subprocess.chec_output(
+            ["git", "-C", str(args.cwd), "rev-parse", "--show-toplevel"],
+            text=True,
+        ).rstrip("\n")
+    )
+    # Make relative for shorter error messages.
+    try:
+        mono_repo = mono_repo.relative_to(Path.cwd())
+    except ValueError:
+        pass
+    try:
+        returncode = args.func(args=args, mono_repo=mono_repo)
+    except subprocess.CalledProcessError as err:
+        cmdline = subprocess.list2cmdline(err.args)
+        print(f"\rFailed to call  {cmdline}")
+        raise
+    assert isinstance(returncode, int), returncode
+    return returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
